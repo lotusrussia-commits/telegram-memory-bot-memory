@@ -1,0 +1,8 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+data/chroma/
+data/uploads/
+.DS_Store
+app/test-memory.txt

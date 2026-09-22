@@ -1,0 +1,6 @@
+aiogram==3.31.0
+chromadb==1.5.9
+openai==3.14.1
+pypdf==6.19.0
+python-docx==1.2.0
+python-dotenv==1.2.3
