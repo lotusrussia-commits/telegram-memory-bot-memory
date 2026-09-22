@@ -2,7 +2,12 @@ import asyncio
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app.config import TELEGRAM_BOT_TOKEN
 from app.llm import ask_llm, create_embedding
@@ -20,16 +25,161 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 
+# Для каждого пользователя храним текущий режим памяти.
+# По умолчанию память включена.
+memory_modes: dict[int, bool] = {}
+
+
+def is_memory_enabled(user_id: int) -> bool:
+    """Возвращает текущий режим памяти пользователя."""
+    return memory_modes.get(user_id, True)
+
+
+def build_memory_keyboard(
+    memory_enabled: bool,
+) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру управления памятью."""
+
+    if memory_enabled:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔴 Выключить память",
+                        callback_data="memory_off",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🗑 Очистить память",
+                        callback_data="memory_reset",
+                    )
+                ],
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧠 Включить память",
+                    callback_data="memory_on",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Очистить память",
+                    callback_data="memory_reset",
+                )
+            ],
+        ]
+    )
+
+
+def memory_status_text(user_id: int) -> str:
+    """Возвращает текст текущего состояния памяти."""
+
+    if is_memory_enabled(user_id):
+        return (
+            "🧠 Память включена.\n\n"
+            "Бот использует:\n"
+            "• краткосрочную историю диалога;\n"
+            "• долгосрочную память в ChromaDB.\n\n"
+            "Сохранённые воспоминания доступны модели."
+        )
+
+    return (
+        "🚫 Память выключена.\n\n"
+        "Бот не использует:\n"
+        "• историю текущего диалога;\n"
+        "• долгосрочную память пользователя.\n\n"
+        "Накопленные воспоминания не удалены."
+    )
+
+
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
+    user_id = message.from_user.id
+
     await message.answer(
-        "Привет! Я бот с памятью.\n\n"
-        "Я помню последние сообщения нашего диалога, "
-        "сохраняю долгосрочную память и могу искать "
-        "информацию в загруженных документах.\n\n"
-        "Команда /reset полностью очищает мою память "
-        "о текущем пользователе."
+        "Привет! Я Telegram-бот с памятью.\n\n"
+        "Я умею:\n"
+        "• запоминать контекст диалога;\n"
+        "• сохранять информацию между перезапусками;\n"
+        "• искать информацию в загруженных документах;\n"
+        "• полностью очищать личную память.\n\n"
+        "Сейчас:\n"
+        f"{memory_status_text(user_id)}\n\n"
+        "Команда /memory открывает управление памятью."
     )
+
+
+@dp.message(Command("memory"))
+async def memory_handler(message: Message) -> None:
+    user_id = message.from_user.id
+
+    await message.answer(
+        memory_status_text(user_id),
+        reply_markup=build_memory_keyboard(
+            is_memory_enabled(user_id)
+        ),
+    )
+
+
+@dp.callback_query(F.data == "memory_on")
+async def memory_on_callback(
+    callback: CallbackQuery,
+) -> None:
+    user_id = callback.from_user.id
+
+    memory_modes[user_id] = True
+
+    await callback.answer("Память включена.")
+
+    if callback.message:
+        await callback.message.edit_text(
+            memory_status_text(user_id),
+            reply_markup=build_memory_keyboard(True),
+        )
+
+
+@dp.callback_query(F.data == "memory_off")
+async def memory_off_callback(
+    callback: CallbackQuery,
+) -> None:
+    user_id = callback.from_user.id
+
+    memory_modes[user_id] = False
+
+    await callback.answer("Память выключена.")
+
+    if callback.message:
+        await callback.message.edit_text(
+            memory_status_text(user_id),
+            reply_markup=build_memory_keyboard(False),
+        )
+
+
+@dp.callback_query(F.data == "memory_reset")
+async def memory_reset_callback(
+    callback: CallbackQuery,
+) -> None:
+    user_id = callback.from_user.id
+
+    clear_all_memory(user_id)
+
+    await callback.answer("Память очищена.")
+
+    if callback.message:
+        await callback.message.edit_text(
+            "🗑 Память пользователя полностью очищена.\n\n"
+            "Краткосрочная история и долгосрочная память "
+            "удалены.\n\n"
+            "База знаний загруженных документов не затронута.",
+            reply_markup=build_memory_keyboard(
+                is_memory_enabled(user_id)
+            ),
+        )
 
 
 @dp.message(Command("reset"))
@@ -39,8 +189,10 @@ async def reset_handler(message: Message) -> None:
     clear_all_memory(user_id)
 
     await message.answer(
-        "Память очищена. "
-        "Начинаем диалог с чистого листа."
+        "🗑 Память очищена.\n\n"
+        "Краткосрочная история и долгосрочная память "
+        "удалены.\n"
+        "База знаний документов не затронута."
     )
 
 
@@ -103,26 +255,30 @@ async def text_handler(message: Message) -> None:
     user_id = message.from_user.id
     user_text = message.text
 
-    # --------------------------------------------------------
-    # 1. Сохраняем сообщение в краткосрочную память
-    # --------------------------------------------------------
-
-    add_message(
-        user_id,
-        "user",
-        user_text,
-    )
+    memory_enabled = is_memory_enabled(user_id)
 
     # --------------------------------------------------------
-    # 2. Создаём embedding пользовательского сообщения
+    # КРАТКОСРОЧНАЯ ПАМЯТЬ
     # --------------------------------------------------------
 
-    query_embedding = await create_embedding(
-        user_text
-    )
+    if memory_enabled:
+        add_message(
+            user_id,
+            "user",
+            user_text,
+        )
 
     # --------------------------------------------------------
-    # 3. Ищем информацию в загруженных документах
+    # EMBEDDING ТЕКУЩЕГО ЗАПРОСА
+    # --------------------------------------------------------
+
+    query_embedding = await create_embedding(user_text)
+
+    # --------------------------------------------------------
+    # ПОИСК ПО ДОКУМЕНТАМ
+    #
+    # Документы являются отдельной базой знаний.
+    # Они доступны независимо от режима личной памяти.
     # --------------------------------------------------------
 
     relevant_chunks = search_memory(
@@ -134,40 +290,59 @@ async def text_handler(message: Message) -> None:
     )
 
     # --------------------------------------------------------
-    # 4. Ищем информацию в долгосрочной памяти
+    # ДОЛГОСРОЧНАЯ ПАМЯТЬ ПОЛЬЗОВАТЕЛЯ
     # --------------------------------------------------------
 
-    remembered_messages = search_user_memory(
-        user_id=user_id,
-        embedding=query_embedding,
-    )
+    memory_context = ""
 
-    memory_context = "\n\n".join(
-        remembered_messages
-    )
+    if memory_enabled:
+        remembered_messages = search_user_memory(
+            user_id=user_id,
+            embedding=query_embedding,
+        )
 
-    # --------------------------------------------------------
-    # 5. Формируем системный промпт
-    # --------------------------------------------------------
-
-    system_prompt = (
-        "Ты полезный Telegram-бот с памятью. "
-        "Отвечай на русском языке.\n\n"
-        "Используй историю текущего диалога для понимания "
-        "контекста.\n\n"
-        "Если в долгосрочной памяти есть информация "
-        "о пользователе или предыдущих сообщениях, "
-        "используй её при ответе.\n\n"
-        "Если есть информация из документов, "
-        "используй её при ответе.\n\n"
-        f"Долгосрочная память:\n"
-        f"{memory_context or 'Нет сохранённой информации.'}\n\n"
-        f"Информация из документов:\n"
-        f"{documents_context or 'Нет подходящей информации.'}"
-    )
+        memory_context = "\n\n".join(
+            remembered_messages
+        )
 
     # --------------------------------------------------------
-    # 6. Формируем запрос к LLM
+    # SYSTEM PROMPT
+    # --------------------------------------------------------
+
+    if memory_enabled:
+        system_prompt = (
+            "Ты полезный Telegram-бот с памятью. "
+            "Отвечай на русском языке.\n\n"
+            "Используй историю текущего диалога "
+            "для понимания контекста.\n\n"
+            "Если в долгосрочной памяти есть информация "
+            "о пользователе или предыдущих сообщениях, "
+            "используй её при ответе.\n\n"
+            "Если есть информация из документов, "
+            "используй её при ответе.\n\n"
+            f"Долгосрочная память:\n"
+            f"{memory_context or 'Нет сохранённой информации.'}\n\n"
+            f"Информация из документов:\n"
+            f"{documents_context or 'Нет подходящей информации.'}"
+        )
+
+    else:
+        system_prompt = (
+            "Ты полезный Telegram-бот. "
+            "Отвечай на русском языке.\n\n"
+            "Режим памяти выключен. "
+            "Не используй и не запоминай личную историю "
+            "пользователя.\n\n"
+            "Обрабатывай текущий запрос независимо "
+            "от предыдущих сообщений.\n\n"
+            "Если есть информация из документов, "
+            "используй её при ответе.\n\n"
+            f"Информация из документов:\n"
+            f"{documents_context or 'Нет подходящей информации.'}"
+        )
+
+    # --------------------------------------------------------
+    # СООБЩЕНИЯ ДЛЯ LLM
     # --------------------------------------------------------
 
     messages = [
@@ -177,51 +352,51 @@ async def text_handler(message: Message) -> None:
         }
     ]
 
-    messages.extend(
-        get_history(user_id)
-    )
+    if memory_enabled:
+        messages.extend(
+            get_history(user_id)
+        )
+
+    else:
+        messages.append(
+            {
+                "role": "user",
+                "content": user_text,
+            }
+        )
 
     # --------------------------------------------------------
-    # 7. Получаем ответ модели
+    # LLM
     # --------------------------------------------------------
 
     answer = await ask_llm(messages)
 
     # --------------------------------------------------------
-    # 8. Сохраняем ответ в краткосрочную память
+    # СОХРАНЕНИЕ В ПАМЯТЬ
     # --------------------------------------------------------
 
-    add_message(
-        user_id,
-        "assistant",
-        answer,
-    )
+    if memory_enabled:
+        add_message(
+            user_id,
+            "assistant",
+            answer,
+        )
 
-    # --------------------------------------------------------
-    # 9. Сохраняем пользовательское сообщение
-    #    в долгосрочную память
-    # --------------------------------------------------------
+        save_user_memory(
+            user_id=user_id,
+            content=user_text,
+            embedding=query_embedding,
+        )
 
-    save_user_memory(
-        user_id=user_id,
-        content=user_text,
-        embedding=query_embedding,
-    )
+        answer_embedding = await create_embedding(
+            answer
+        )
 
-    # --------------------------------------------------------
-    # 10. Сохраняем ответ бота
-    #     в долгосрочную память
-    # --------------------------------------------------------
-
-    answer_embedding = await create_embedding(
-        answer
-    )
-
-    save_user_memory(
-        user_id=user_id,
-        content=answer,
-        embedding=answer_embedding,
-    )
+        save_user_memory(
+            user_id=user_id,
+            content=answer,
+            embedding=answer_embedding,
+        )
 
     await message.answer(answer)
 
